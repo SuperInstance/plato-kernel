@@ -3,7 +3,7 @@
 //! Creates first-person perspectives based on identity + constraints.
 //! No omniscience - entities see only what permissions allow.
 
-use crate::constraint_engine::{ConstraintMatrix, Constraint};
+use crate::constraint_engine::ConstraintMatrix;
 use tokio::sync::broadcast;
 
 /// A first-person perspective in Plato
@@ -18,7 +18,7 @@ pub struct Perspective {
 }
 
 /// A session connecting an identity to a room
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct Session {
     pub identity: String,
     pub room: String,

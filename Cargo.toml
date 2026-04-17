@@ -1,3 +1,9 @@
+[workspace]
+members = [
+    ".",
+    "crates/constraint-theory-core",
+]
+
 [package]
 name = "plato-kernel"
 version = "0.1.0"
@@ -6,8 +12,8 @@ description = "Plato Kernel - Event sourcing + Constraint-Theory + Git runtime"
 license = "MIT"
 
 [dependencies]
-# Constraint Theory (local path — synthesis workspace sibling)
-constraint-theory-core = { path = "../constraint-theory/crates/constraint-theory-core" }
+# Constraint Theory core types (local crate — workspace member)
+constraint-theory-core = { path = "crates/constraint-theory-core" }
 
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
@@ -16,18 +22,13 @@ tokio = { version = "1.36", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 
-# Git runtime
-git2 = "0.18"
-async-git = "0.1"  # Or use git2 with async wrapper
-
-# Event sourcing
-uuid = { version = "1.7", features = ["v4", "serde"] }
+# Event sourcing — pin uuid to 1.4.x to stay on getrandom 0.2 (Rust 1.75 compat)
+uuid = { version = "=1.4.1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
-deadqueue = "0.3"  # DLQ implementation
 
 # Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Error handling
 thiserror = "1.0"
@@ -35,6 +36,8 @@ anyhow = "1.0"
 
 [dev-dependencies]
 tokio-test = "0.4"
+
+getrandom = "0.2"
 
 [[bin]]
 name = "plato-kernel"

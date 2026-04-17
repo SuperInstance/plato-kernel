@@ -24,12 +24,11 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use constraint_engine::{ConstraintAuditor, ConstraintEngine};
 use episode_recorder::{EpisodeEntry, EpisodeOutcome, EpisodeRecorder};
-use i2i::{ComponentKind, I2IMessage, I2IVerb, InstanceId};
+use i2i::{ComponentKind, I2IMessage, I2IVerb, I2IServer, InstanceId, default_kernel_handler};
 use tiling::TileRegistry;
 use tutor::{jump_context, JumpResult};
 
 /// The complete Plato Kernel runtime.
-#[derive(Debug)]
 pub struct PlatoKernel {
     event_bus: event_bus::EventBus,
     constraint_engine: ConstraintEngine,
@@ -214,6 +213,16 @@ async fn main() -> Result<()> {
         "## PaymentFlow\nHandles [Settlement] requests.\n\n## Settlement\nClears funds.\n";
     let registry = TileRegistry::parse(sample_doc);
     tracing::info!("Tiling: {} tiles parsed from sample doc", registry.len());
+
+    // Start the I2I TCP server on port 7272
+    let i2i_handler = default_kernel_handler(kernel.instance_id.clone());
+    let i2i_server = I2IServer::new(i2i_handler);
+    tokio::spawn(async move {
+        if let Err(e) = i2i_server.serve().await {
+            tracing::error!("I2I server error: {}", e);
+        }
+    });
+    tracing::info!("I2I server spawned on TCP 0.0.0.0:7272");
 
     // Keep the kernel running
     tokio::signal::ctrl_c().await?;

@@ -367,7 +367,9 @@ impl ConstraintAuditor {
                 false
             }
             AssertionKind::Must | AssertionKind::Should => {
-                // Find what is required — words after "must be" / "must" / "should"
+                // Find what is required — words after "must be" / "must" / "should".
+                // Try most-specific markers first; break after the first match so that
+                // "must be" doesn't also get re-evaluated as "must" with a longer extract.
                 for marker in ["must be ", "must ", "shall ", "should ", "always "] {
                     if let Some(pos) = lower_pred.find(marker) {
                         let required: String = lower_pred[pos + marker.len()..]
@@ -375,9 +377,8 @@ impl ConstraintAuditor {
                             .take(2)
                             .collect::<Vec<_>>()
                             .join(" ");
-                        if !required.is_empty() && !lower_out.contains(&required) {
-                            return true;
-                        }
+                        let violated = !required.is_empty() && !lower_out.contains(&required);
+                        return violated; // First matching marker is authoritative
                     }
                 }
                 false

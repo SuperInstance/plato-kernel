@@ -1,0 +1,9 @@
+[package]
+name = "constraint-theory-core"
+version = "0.1.0"
+edition = "2021"
+description = "Constraint Theory core types — first-person perspective filtering primitives"
+license = "MIT"
+
+[dependencies]
+serde = { version = "1.0", features = ["derive"] }

@@ -27,6 +27,9 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::fmt;
+use std::sync::Arc;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::net::{TcpListener, TcpStream};
 use uuid::Uuid;
 
 /// Protocol version string.
@@ -258,6 +261,201 @@ pub enum I2IParseError {
     UnknownVerb(String),
     #[error("Invalid JSON payload")]
     InvalidPayload,
+}
+
+// ─── TCP Server ──────────────────────────────────────────────────────────────
+
+/// Callback type invoked for every well-formed inbound I2I message.
+///
+/// Returns an optional reply that the server writes back to the peer.
+pub type MessageHandler = Arc<dyn Fn(I2IMessage) -> Option<I2IMessage> + Send + Sync>;
+
+/// The I2I TCP server — listens on `0.0.0.0:7272` for plato-tui and other
+/// instance connections.
+///
+/// The server accepts one connection at a time per spawned task.  Each
+/// connection may send multiple messages; the server replies to each and keeps
+/// the connection alive until the peer closes it.
+pub struct I2IServer {
+    bind_addr: String,
+    handler: MessageHandler,
+}
+
+impl I2IServer {
+    /// Bind to the standard I2I port (TCP 7272).
+    pub fn new(handler: MessageHandler) -> Self {
+        Self {
+            bind_addr: "0.0.0.0:7272".to_string(),
+            handler,
+        }
+    }
+
+    /// Bind to a custom address (useful for testing).
+    pub fn with_addr(addr: impl Into<String>, handler: MessageHandler) -> Self {
+        Self {
+            bind_addr: addr.into(),
+            handler,
+        }
+    }
+
+    /// Start accepting connections.  This future runs until the task is
+    /// cancelled (e.g. via `tokio::select!` with a shutdown signal).
+    pub async fn serve(self) -> anyhow::Result<()> {
+        let listener = TcpListener::bind(&self.bind_addr).await?;
+        tracing::info!("I2I server listening on {}", self.bind_addr);
+
+        let handler = self.handler.clone();
+
+        loop {
+            match listener.accept().await {
+                Ok((stream, peer)) => {
+                    tracing::debug!("I2I: accepted connection from {}", peer);
+                    let h = handler.clone();
+                    tokio::spawn(async move {
+                        if let Err(e) = handle_connection(stream, h).await {
+                            tracing::warn!("I2I connection error from {}: {}", peer, e);
+                        }
+                    });
+                }
+                Err(e) => {
+                    tracing::error!("I2I accept error: {}", e);
+                }
+            }
+        }
+    }
+}
+
+/// Handle a single TCP connection: read I2I messages, dispatch, reply.
+async fn handle_connection(
+    stream: TcpStream,
+    handler: MessageHandler,
+) -> anyhow::Result<()> {
+    let (reader_half, mut writer_half) = stream.into_split();
+    let mut lines = BufReader::new(reader_half).lines();
+
+    // Accumulate lines into a message buffer.
+    // Wire format: header lines terminated by a blank line, then JSON body.
+    let mut buf = String::new();
+    let mut blank_seen = false;
+    let mut body_lines: Vec<String> = Vec::new();
+
+    while let Some(line) = lines.next_line().await? {
+        if !blank_seen {
+            if line.is_empty() {
+                blank_seen = true;
+                buf.push('\n');
+            } else {
+                buf.push_str(&line);
+                buf.push('\n');
+            }
+        } else {
+            // Accumulate JSON body until the peer sends another blank line
+            // (message terminator) or closes the connection.
+            if line.is_empty() {
+                // End of this message — dispatch it
+                let full = format!("{}\n{}", buf, body_lines.join("\n"));
+                blank_seen = false;
+
+                match I2IMessage::from_wire(&full) {
+                    Ok(msg) => {
+                        tracing::debug!("I2I rx: {:?} → {}", msg.verb, msg.target);
+                        if let Some(reply) = handler(msg) {
+                            let wire = reply.to_wire();
+                            // Terminate with a blank line so the peer knows the reply ended.
+                            writer_half.write_all(wire.as_bytes()).await?;
+                            writer_half.write_all(b"\n").await?;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::warn!("I2I parse error: {}", e);
+                    }
+                }
+
+                buf.clear();
+                body_lines.clear();
+            } else {
+                body_lines.push(line);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the default kernel-side message handler.
+///
+/// Handles `TUTOR_JUMP` and `CONSTRAINT_CHECK` verbs inline; all other verbs
+/// produce no reply (fire-and-forget notifications are ignored server-side).
+pub fn default_kernel_handler(kernel_id: InstanceId) -> MessageHandler {
+    Arc::new(move |msg: I2IMessage| -> Option<I2IMessage> {
+        match &msg.verb {
+            I2IVerb::TutorJump => {
+                let anchor = msg
+                    .payload
+                    .get("anchor")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                tracing::info!("I2I TUTOR_JUMP for anchor '{}'", anchor);
+                let reply = I2IMessage {
+                    version: I2I_VERSION.to_string(),
+                    verb: I2IVerb::Response,
+                    target: msg.from.to_string(),
+                    from: kernel_id.clone(),
+                    to: msg.from.clone(),
+                    nonce: Uuid::new_v4(),
+                    timestamp: Utc::now(),
+                    payload: serde_json::json!({
+                        "anchor": anchor,
+                        "status": "queued",
+                        "note": "TUTOR jump enqueued — tile will be injected into next prompt context"
+                    }),
+                    in_reply_to: Some(msg.nonce),
+                };
+                Some(reply)
+            }
+            I2IVerb::ConstraintCheck => {
+                let command = msg
+                    .payload
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                tracing::info!("I2I CONSTRAINT_CHECK for command '{}'", command);
+                // Lexical allow-list: the kernel can do a deeper check; for the
+                // protocol layer we return the structural result immediately.
+                let result = if command.starts_with('@') || command.starts_with("delete") {
+                    "Deny"
+                } else {
+                    "Allow"
+                };
+                let reply = I2IMessage {
+                    version: I2I_VERSION.to_string(),
+                    verb: I2IVerb::ConstraintResult,
+                    target: msg.from.to_string(),
+                    from: kernel_id.clone(),
+                    to: msg.from.clone(),
+                    nonce: Uuid::new_v4(),
+                    timestamp: Utc::now(),
+                    payload: serde_json::json!({
+                        "command": command,
+                        "result": result
+                    }),
+                    in_reply_to: Some(msg.nonce),
+                };
+                Some(reply)
+            }
+            I2IVerb::Announce => {
+                tracing::info!("I2I: instance announced: {}", msg.from);
+                None
+            }
+            I2IVerb::Disconnect => {
+                tracing::info!("I2I: instance disconnected: {}", msg.from);
+                None
+            }
+            _ => None,
+        }
+    })
 }
 
 #[cfg(test)]

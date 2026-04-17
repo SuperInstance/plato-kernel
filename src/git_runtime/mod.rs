@@ -4,7 +4,6 @@
 
 use std::process::Command;
 use anyhow::Result;
-use serde::{Deserialize, Serialize};
 
 /// A git repository representing a room in Plato
 #[derive(Debug, Clone)]
