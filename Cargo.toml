@@ -6,6 +6,9 @@ description = "Plato Kernel - Event sourcing + Constraint-Theory + Git runtime"
 license = "MIT"
 
 [dependencies]
+# Constraint Theory (local path — synthesis workspace sibling)
+constraint-theory-core = { path = "../constraint-theory/crates/constraint-theory-core" }
+
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
 
