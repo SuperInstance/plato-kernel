@@ -17,6 +17,7 @@ mod git_runtime;
 mod i2i;
 mod perspective;
 mod plugin;
+mod runtime;
 mod tiling;
 mod tutor;
 
@@ -330,6 +331,22 @@ async fn main() -> Result<()> {
         "## PaymentFlow\nHandles [Settlement] requests.\n\n## Settlement\nClears funds.\n";
     let registry = TileRegistry::parse(sample_doc);
     tracing::info!("Tiling: {} tiles parsed from sample doc", registry.len());
+
+    // ── Pillar 5: Unified PLATO Runtime demo ─────────────────────────────────
+    // Constraints doc: any bullets with modal verbs become runtime assertions.
+    let constraints_doc = "- Output should include context.\n";
+    let plato_rt = runtime::PlatoRuntime::new(sample_doc, constraints_doc, "KNOWLEDGE.md");
+    let response = plato_rt.process_query(
+        "How does [PaymentFlow] interact with [Settlement]?",
+        "plato-kernel",
+    );
+    tracing::info!(
+        "PLATO runtime response — tiles={:?}, anchors={:?}, confidence={:.1}, constraints_checked={}",
+        response.tiles_used,
+        response.anchors_expanded,
+        response.confidence,
+        response.constraints_checked,
+    );
 
     // Start the I2I TCP server on port 7272
     let i2i_handler = default_kernel_handler(kernel.instance_id.clone());

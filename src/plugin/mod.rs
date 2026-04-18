@@ -313,18 +313,29 @@ impl PluginRegistry {
     ///
     /// Location: `src/plugin/mod.rs`, method `mount_tier` — ~8-12 lines.
     pub fn mount_tier(&mut self, tier: PluginTier) -> Result<Vec<MountPlan>, DependencyError> {
-        // TODO: implement this. Suggested shape:
-        //
-        //   let targets: Vec<String> = self.plugins
-        //       .iter()
-        //       .filter(|(_, p)| p.manifest().tier == tier)
-        //       .map(|(id, _)| id.clone())
-        //       .collect();
-        //
-        //   // sort `targets` by your chosen strategy, then mount each.
-        //   // Return early on error (fail-fast) or accumulate results (best-effort).
-        let _ = tier;
-        todo!("implement mount_tier — see doc-comment above for guidance")
+        // Collect all registered plugins at exactly this tier.
+        let mut targets: Vec<String> = self.plugins
+            .iter()
+            .filter(|(_, p)| p.manifest().tier == tier)
+            .map(|(id, _)| id.clone())
+            .collect();
+
+        // Sort for deterministic mount order across HashMap iterations.
+        targets.sort();
+
+        let mut plans = Vec::new();
+        for id in targets {
+            if self.mounted.contains(&id) {
+                continue; // idempotent — skip already-mounted plugins
+            }
+            // resolve_mount performs full Kahn topo-sort over transitive deps,
+            // so lower-tier deps are mounted before this plugin. Fail-fast: any
+            // missing dep, cycle, or tier violation bubbles up immediately.
+            let plan = self.resolve_mount(&id)?;
+            self.apply_plan(&plan);
+            plans.push(plan);
+        }
+        Ok(plans)
     }
 
     /// Returns `true` if a mounted plugin declares `capability` in its `provides` list.
