@@ -21,6 +21,7 @@ tokio = { version = "1.36", features = ["full"] }
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+serde_yaml = "0.8.26"
 
 # Event sourcing — pin uuid to 1.4.x to stay on getrandom 0.2 (Rust 1.75 compat)
 uuid = { version = "=1.4.1", features = ["v4", "serde"] }
@@ -33,6 +34,16 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # Error handling
 thiserror = "1.0"
 anyhow = "1.0"
+
+[features]
+# Tier 2: fleet coordination — I2I swarm, Kimi swarm router.
+# Compiled in for any instance that participates in multi-ship operations.
+fleet = []
+
+# Tier 3: edge/GPU — GPU simulation, LoRA fine-tuning, CUDA MUD arena.
+# Only Forgemaster-class nodes (RTX 4050+) should enable this.
+# Automatically enables `fleet` since Edge plugins depend on Fleet plugins.
+edge = ["fleet"]
 
 [dev-dependencies]
 tokio-test = "0.4"

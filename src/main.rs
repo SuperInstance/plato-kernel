@@ -16,15 +16,20 @@ mod event_bus;
 mod git_runtime;
 mod i2i;
 mod perspective;
+mod plugin;
 mod tiling;
 mod tutor;
 
 use anyhow::Result;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use constraint_engine::{ConstraintAuditor, ConstraintEngine};
 use episode_recorder::{EpisodeEntry, EpisodeOutcome, EpisodeRecorder};
 use i2i::{ComponentKind, I2IMessage, I2IVerb, I2IServer, InstanceId, default_kernel_handler};
+use plugin::{PluginRegistry, PluginTier};
+use plugin::loader::load_builtins;
 use tiling::TileRegistry;
 use tutor::{jump_context, JumpResult};
 
@@ -32,10 +37,14 @@ use tutor::{jump_context, JumpResult};
 pub struct PlatoKernel {
     event_bus: event_bus::EventBus,
     constraint_engine: ConstraintEngine,
-    git_runtime: git_runtime::GitRuntime,
+    git_runtime: Arc<Mutex<git_runtime::GitRuntime>>,
     perspective_manager: perspective::PerspectiveManager,
     episode_recorder: EpisodeRecorder,
     instance_id: InstanceId,
+    /// Plugin registry — populated by [`load_builtins`] at startup.
+    /// Plugins at higher tiers (Fleet, Edge) are only present when the
+    /// corresponding Cargo feature is active at build time.
+    pub plugins: PluginRegistry,
 }
 
 impl PlatoKernel {
@@ -43,14 +52,55 @@ impl PlatoKernel {
     pub async fn new() -> Result<Self> {
         tracing::info!("Initializing Plato Kernel...");
 
+        // Bootstrap the plugin registry: register all builtins for the
+        // current feature set, then mount the Core tier (always safe).
+        let mut plugins = PluginRegistry::new();
+        load_builtins(&mut plugins);
+
+        // Mount core plugins individually (mount_tier is user-contributed).
+        for id in ["core-event-bus", "core-constraint", "core-git-runtime", "core-tiling"] {
+            if let Err(e) = plugins.mount(id) {
+                tracing::warn!("plugin mount skipped ({id}): {e}");
+            }
+        }
+
+        // Fleet-tier mounts (only compiled when `fleet` feature is active).
+        #[cfg(feature = "fleet")]
+        for id in ["fleet-swarm", "kimi-swarm-router", "fleet-episode-sync"] {
+            if let Err(e) = plugins.mount(id) {
+                tracing::warn!("plugin mount skipped ({id}): {e}");
+            }
+        }
+
+        // Edge-tier mounts (only compiled when `edge` feature is active).
+        #[cfg(feature = "edge")]
+        for id in ["gpu-simulation", "lora-finetuning", "cuda-mud-arena"] {
+            if let Err(e) = plugins.mount(id) {
+                tracing::warn!("plugin mount skipped ({id}): {e}");
+            }
+        }
+
+        tracing::info!(
+            "Plugin tiers active: Core{}{}",
+            if cfg!(feature = "fleet") { " + Fleet" } else { "" },
+            if cfg!(feature = "edge")  { " + Edge"  } else { "" },
+        );
+
         Ok(Self {
             event_bus: event_bus::EventBus::new(),
             constraint_engine: ConstraintEngine::new(),
-            git_runtime: git_runtime::GitRuntime::new().await?,
+            git_runtime: Arc::new(Mutex::new(git_runtime::GitRuntime::new().await?)),
             perspective_manager: perspective::PerspectiveManager::new(),
             episode_recorder: EpisodeRecorder::default_path(),
             instance_id: InstanceId::new(ComponentKind::Kernel, "plato-kernel", "localhost"),
+            plugins,
         })
+    }
+
+    /// Join a fleet by connecting to the Agora meta-repo
+    pub async fn join_fleet(&self, agora_remote: &str) -> Result<()> {
+        let mut rt = self.git_runtime.lock().await;
+        rt.join_fleet(agora_remote).await
     }
 
     /// Connect an identity to a room (repo).
@@ -61,7 +111,8 @@ impl PlatoKernel {
     ) -> Result<perspective::Session> {
         tracing::info!("Connecting {} to room {}", identity, room);
 
-        let repo = self.git_runtime.checkout(room).await?;
+        let mut rt = self.git_runtime.lock().await;
+        let repo = rt.checkout(room).await?;
         let constraints = self.constraint_engine.load_constraints(&repo.name, identity)?;
         let perspective = self.perspective_manager.create_perspective(identity, constraints);
         let events = self.event_bus.subscribe(identity, room).await;
@@ -176,6 +227,62 @@ impl PlatoKernel {
                 );
                 Some(reply)
             }
+            I2IVerb::Request => {
+                // Handle fleet-related requests
+                if msg.target == "fleet/list" {
+                    let mut rt = self.git_runtime.lock().await;
+                    if let Ok(rooms) = rt.list_fleet_rooms().await {
+                        let rooms_json: Vec<_> = rooms.iter().map(|r| {
+                            serde_json::json!({
+                                "repo": r.repo,
+                                "type": r.room_type,
+                                "agents": r.agents
+                            })
+                        }).collect();
+                        let reply = I2IMessage::reply(
+                            &msg,
+                            I2IVerb::Response,
+                            serde_json::json!({ "rooms": rooms_json }),
+                        );
+                        Some(reply)
+                    } else {
+                        let reply = I2IMessage::reply(
+                            &msg,
+                            I2IVerb::Response,
+                            serde_json::json!({ "error": "Not joined to any fleet" }),
+                        );
+                        Some(reply)
+                    }
+                } else if msg.target.starts_with("fleet/join") {
+                    let agora_remote = msg.payload.get("agora_remote").and_then(|v| v.as_str()).unwrap_or("");
+                    if !agora_remote.is_empty() {
+                        if let Err(e) = self.join_fleet(agora_remote).await {
+                            let reply = I2IMessage::reply(
+                                &msg,
+                                I2IVerb::Response,
+                                serde_json::json!({ "status": "failed", "error": e.to_string() }),
+                            );
+                            Some(reply)
+                        } else {
+                            let reply = I2IMessage::reply(
+                                &msg,
+                                I2IVerb::Response,
+                                serde_json::json!({ "status": "success", "message": "Joined fleet successfully" }),
+                            );
+                            Some(reply)
+                        }
+                    } else {
+                        let reply = I2IMessage::reply(
+                            &msg,
+                            I2IVerb::Response,
+                            serde_json::json!({ "status": "failed", "error": "Missing agora_remote parameter" }),
+                        );
+                        Some(reply)
+                    }
+                } else {
+                    None
+                }
+            }
             _ => None,
         }
     }
@@ -208,6 +315,16 @@ async fn main() -> Result<()> {
         kernel.instance_id
     );
 
+    // Log mounted plugin inventory for ops visibility.
+    let mut mounted: Vec<&str> = kernel.plugins.mounted_ids().collect();
+    mounted.sort();
+    tracing::info!("Mounted plugins [{}]: {:?}", mounted.len(), mounted);
+
+    // Capability checks let subsystems query the plugin graph without
+    // caring about feature flags directly.
+    debug_assert!(kernel.plugins.provides("event-bus"),      "core-event-bus must be mounted");
+    debug_assert!(kernel.plugins.provides("constraint-engine"), "core-constraint must be mounted");
+
     // Demonstrate tiling: parse a sample doc
     let sample_doc =
         "## PaymentFlow\nHandles [Settlement] requests.\n\n## Settlement\nClears funds.\n";
@@ -223,6 +340,12 @@ async fn main() -> Result<()> {
         }
     });
     tracing::info!("I2I server spawned on TCP 0.0.0.0:7272");
+
+    // Example: Join a fleet (can also be triggered via I2I)
+    // kernel.join_fleet("https://github.com/PlatoFleet/agora.git").await?;
+    // let mut rt = kernel.git_runtime.lock().await;
+    // let rooms = rt.list_fleet_rooms().await?;
+    // tracing::info!("Fleet rooms: {:?}", rooms);
 
     // Keep the kernel running
     tokio::signal::ctrl_c().await?;
