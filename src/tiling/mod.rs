@@ -10,6 +10,8 @@
 
 use std::collections::HashMap;
 
+use crate::vocab::VocabIndex;
+
 /// A single semantic tile — one `##`-delimited section of a Markdown document.
 #[derive(Debug, Clone)]
 pub struct KnowledgeTile {
@@ -23,6 +25,8 @@ pub struct KnowledgeTile {
     pub position: usize,
     /// Tags extracted from the tile body (words inside `[brackets]`)
     pub word_anchors: Vec<String>,
+    /// HAV vocabulary term ids matched against this tile's body.
+    pub vocab_tags: Vec<String>,
 }
 
 impl KnowledgeTile {
@@ -88,6 +92,7 @@ impl TileRegistry {
                         body: current_body.clone(),
                         position,
                         word_anchors,
+                        vocab_tags: Vec::new(),
                     });
                     position += 1;
                 }
@@ -109,6 +114,7 @@ impl TileRegistry {
                 body: current_body,
                 position,
                 word_anchors,
+                vocab_tags: Vec::new(),
             });
         }
 
@@ -165,6 +171,18 @@ impl TileRegistry {
     pub fn is_empty(&self) -> bool {
         self.tiles.is_empty()
     }
+
+    /// Enrich every tile with HAV vocabulary tags matched against its body.
+    /// Call once after `parse()` when vocab tagging is desired.
+    pub fn tag_tiles_with_vocab(&mut self, index: &VocabIndex) {
+        for tile in &mut self.tiles {
+            tile.vocab_tags = index
+                .tag_tile(&tile.body)
+                .into_iter()
+                .map(|t| t.id.to_string())
+                .collect();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -212,5 +230,27 @@ Refunds reference the original [PaymentFlow].
         // Position 1 (Settlement), window 1/1 → tiles 0,1,2
         let ctx = reg.inject_context(1, 1, 1);
         assert_eq!(ctx.len(), 3);
+    }
+
+    #[test]
+    fn test_vocab_tags_populated_after_tagging() {
+        let mut reg = TileRegistry::parse(
+            "## Consensus Phase\nThe fleet uses consensus and deliberation to decide.\n",
+        );
+        let vocab = crate::vocab::VocabIndex::new();
+        reg.tag_tiles_with_vocab(&vocab);
+        let tile = reg.get_at(0).unwrap();
+        assert!(
+            !tile.vocab_tags.is_empty(),
+            "expected vocab tags on tile with 'consensus'"
+        );
+    }
+
+    #[test]
+    fn test_untagged_tiles_have_empty_vocab_tags() {
+        let reg = TileRegistry::parse(SAMPLE);
+        for tile in reg.all() {
+            assert!(tile.vocab_tags.is_empty(), "expected no vocab tags before tagging");
+        }
     }
 }

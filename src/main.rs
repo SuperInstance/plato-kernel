@@ -20,6 +20,7 @@ mod plugin;
 mod runtime;
 mod tiling;
 mod tutor;
+mod vocab;
 
 use anyhow::Result;
 use std::sync::Arc;
