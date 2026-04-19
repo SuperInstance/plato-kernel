@@ -10,6 +10,9 @@
 //! it implicitly in `process_command()`. This trait makes the pattern explicit,
 //! swappable, and testable — a hull bolt in the fleet architecture.
 
+use crate::deadband::{DeadbandCheck, DeadbandEngine};
+use crate::tile_scoring::{rank_tiles, TileScore};
+
 /// Which state produced this output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StateSource {
@@ -54,6 +57,18 @@ impl BridgedResult {
     }
 }
 
+/// Lightweight tile descriptor for StateBridge scoring calls.
+pub struct TileInput {
+    pub tile_id: usize,
+    pub question: String,
+    pub answer: String,
+    pub tags: Vec<String>,
+    pub domain: String,
+    pub confidence: f64,
+    pub ghost_score: f64,
+    pub use_count: u32,
+}
+
 /// The StateBridge trait — bidirectional translation between deterministic
 /// and generative states.
 ///
@@ -61,25 +76,25 @@ impl BridgedResult {
 /// - `to_generative_prompt`: deterministic result → prompt for LLM
 /// - `from_generative_output`: LLM output → deterministic result
 /// - `check_coherence`: measure agreement between states
+/// - `check_deadband`: safety pre-flight gate (default: always pass)
+/// - `score_tiles`: score and rank tiles against a query
 pub trait StateBridge {
     /// Translate a deterministic result into a prompt for the generative state.
-    /// This is how TUTOR anchors, constraint checks, and instinct reflexes
-    /// feed into the LLM context.
     fn to_generative_prompt(&self, deterministic: &BridgedResult) -> String;
 
     /// Translate a generative (LLM) output back into a deterministic result.
-    /// This is how LLM responses get scored, tagged, and stored as tiles.
     fn from_generative_output(&self, raw_output: &str, context: &str) -> BridgedResult;
 
     /// Check coherence between deterministic and generative results.
     /// Returns 0.0 (contradictory) to 1.0 (perfectly aligned).
-    /// Used to detect hallucination, drift, or constraint violations.
     fn check_coherence(&self, deterministic: &BridgedResult, generative: &BridgedResult) -> f64;
 
-    /// Run deadband safety check on an action string.
-    /// Default impl always passes (override in DefaultStateBridge).
-    fn check_deadband(&self, _action: &str) -> crate::deadband::DeadbandCheck {
-        crate::deadband::DeadbandCheck {
+    /// Run the deadband safety pre-flight check on an action string.
+    ///
+    /// Default implementation always passes — `DefaultStateBridge` overrides this
+    /// with real P0/P1 pattern matching.
+    fn check_deadband(&self, _action: &str) -> DeadbandCheck {
+        DeadbandCheck {
             passed: true,
             p0_clear: true,
             p1_clear: true,
@@ -88,12 +103,17 @@ pub trait StateBridge {
         }
     }
 
-    /// Score a slice of tiles against a query.
-    /// tiles: (question, answer, domain, confidence, ghost_score, use_count)
-    fn score_tiles(&self, tiles: &[(&str, &str, &str, f64, f64, u32)], query: &str) -> Vec<crate::tile_scoring::TileScore> {
-        tiles.iter().enumerate().map(|(i, (q, a, d, conf, ghost, uses))| {
-            crate::tile_scoring::score_tile(i, query, q, a, &[], d, *conf, *ghost, *uses)
-        }).collect()
+    /// Score and rank a slice of tile inputs against a query string.
+    ///
+    /// Returns tiles sorted by descending relevance, limited to `limit` results.
+    fn score_tiles(&self, tiles: &[TileInput], query: &str, limit: usize) -> Vec<TileScore> {
+        let scores: Vec<TileScore> = tiles.iter()
+            .map(|t| crate::tile_scoring::score_tile(
+                t.tile_id, query, &t.question, &t.answer,
+                &t.tags, &t.domain, t.confidence, t.ghost_score, t.use_count,
+            ))
+            .collect();
+        rank_tiles(scores, limit)
     }
 }
 
@@ -108,16 +128,13 @@ pub trait StateBridge {
 pub struct DefaultStateBridge {
     /// Minimum coherence threshold for Hybrid results.
     coherence_threshold: f64,
-    /// Deadband engine for safety pre-checks.
-    pub deadband: crate::deadband::DeadbandEngine,
+    /// Deadband safety engine — seeded with default P0/P1 patterns.
+    pub deadband: DeadbandEngine,
 }
 
 impl DefaultStateBridge {
     pub fn new() -> Self {
-        Self {
-            coherence_threshold: 0.3,
-            deadband: crate::deadband::DeadbandEngine::new(),
-        }
+        Self { coherence_threshold: 0.3, deadband: DeadbandEngine::new() }
     }
 
     pub fn with_threshold(mut self, threshold: f64) -> Self {
@@ -139,6 +156,10 @@ impl Default for DefaultStateBridge {
 }
 
 impl StateBridge for DefaultStateBridge {
+    fn check_deadband(&self, action: &str) -> DeadbandCheck {
+        self.deadband.check(action)
+    }
+
     fn to_generative_prompt(&self, deterministic: &BridgedResult) -> String {
         match deterministic.source {
             StateSource::Deterministic => {
@@ -179,10 +200,6 @@ impl StateBridge for DefaultStateBridge {
         let union: std::collections::HashSet<String> =
             det_words.iter().chain(gen_words.iter()).cloned().collect();
         overlap as f64 / union.len() as f64
-    }
-
-    fn check_deadband(&self, action: &str) -> crate::deadband::DeadbandCheck {
-        self.deadband.check(action)
     }
 }
 
@@ -264,5 +281,50 @@ mod tests {
     fn test_state_source_equality() {
         assert_eq!(StateSource::Deterministic, StateSource::Deterministic);
         assert_ne!(StateSource::Deterministic, StateSource::Generative);
+    }
+
+    #[test]
+    fn test_check_deadband_blocks_p0() {
+        let bridge = DefaultStateBridge::new();
+        let check = bridge.check_deadband("rm -rf /tmp/data");
+        assert!(!check.passed);
+        assert!(!check.p0_clear);
+    }
+
+    #[test]
+    fn test_check_deadband_passes_safe_action() {
+        let bridge = DefaultStateBridge::new();
+        let check = bridge.check_deadband("calculate the sum of values");
+        assert!(check.passed);
+    }
+
+    #[test]
+    fn test_score_tiles_returns_ranked_results() {
+        let bridge = DefaultStateBridge::new();
+        let tiles = vec![
+            TileInput {
+                tile_id: 0,
+                question: "constraint theory overview".to_string(),
+                answer: "Pythagorean snap coordinates".to_string(),
+                tags: vec![],
+                domain: "constraint".to_string(),
+                confidence: 0.9,
+                ghost_score: 0.0,
+                use_count: 10,
+            },
+            TileInput {
+                tile_id: 1,
+                question: "completely unrelated topic".to_string(),
+                answer: "gardening and horticulture tips".to_string(),
+                tags: vec![],
+                domain: "gardening".to_string(),
+                confidence: 0.5,
+                ghost_score: 0.5,
+                use_count: 0,
+            },
+        ];
+        let results = bridge.score_tiles(&tiles, "constraint theory", 10);
+        assert!(!results.is_empty());
+        assert_eq!(results[0].tile_id, 0);
     }
 }
