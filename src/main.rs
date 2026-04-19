@@ -127,6 +127,8 @@ impl PlatoKernel {
 
     /// Process a command through the full PLATO pipeline:
     ///
+    /// 0. [NEW] Run instinct pre-check — reflexes fire before constraint logic.
+    ///    Survive/Flee/Report instincts can short-circuit the pipeline.
     /// 1. Extract `[WordAnchor]` TUTOR jumps and inject matching tiles.
     /// 2. Check assertive constraints from the room's Markdown constraints.
     /// 3. Record the episode to KNOWLEDGE.md.
@@ -138,8 +140,50 @@ impl PlatoKernel {
         command: &str,
         tile_registry: &TileRegistry,
         auditor: &ConstraintAuditor,
+        instinct_context: Option<&InstinctContext>,
     ) -> ActionResult {
         tracing::debug!("process_command: {} in {} → {:?}", identity, room, command);
+
+        // Step 0: Instinct pre-check — reflexes before logic
+        if let Some(ctx) = instinct_context {
+            let reflexes = ctx.engine.tick(ctx.energy, ctx.threat, ctx.trust, ctx.peer_alive, ctx.has_work);
+            let highest = reflexes.first();
+            if let Some(r) = highest {
+                match r.instinct {
+                    InstinctType::Survive if r.urgency > 0.8 => {
+                        tracing::warn!("Instinct SURVIVE triggered (urgency {:.2}) — blocking command", r.urgency);
+                        let entry = EpisodeEntry::new(
+                            &format!("{} in {}", command, room),
+                            &format!("BLOCKED by SURVIVE instinct (urgency {:.2})", r.urgency),
+                            "Instinct override", EpisodeOutcome::Failure,
+                        );
+                        let _ = self.episode_recorder.record(&entry);
+                        return ActionResult {
+                            command: command.to_string(),
+                            tutor_context: vec![format!("[INSTINCT] SURVIVE — energy critical ({:.0}%). Command blocked.", ctx.energy * 100.0)],
+                            audit: constraint_engine::AuditOutcome::Pass,
+                            episode_id: entry.id,
+                            instinct_reflexes: Some(reflexes.iter().map(|r| r.instinct.name().to_string()).collect()),
+                        };
+                    }
+                    InstinctType::Flee if r.urgency > 0.7 => {
+                        tracing::warn!("Instinct FLEE triggered (urgency {:.2}) — deferring command", r.urgency);
+                        return ActionResult {
+                            command: command.to_string(),
+                            tutor_context: vec![format!("[INSTINCT] FLEE — threat elevated ({:.0}%). Command deferred.", ctx.threat * 100.0)],
+                            audit: constraint_engine::AuditOutcome::Pass,
+                            episode_id: String::new(),
+                            instinct_reflexes: Some(reflexes.iter().map(|r| r.instinct.name().to_string()).collect()),
+                        };
+                    }
+                    InstinctType::Report if r.urgency > 0.3 => {
+                        tracing::info!("Instinct REPORT triggered — anomaly zone");
+                        // Report doesn't block, just annotates
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         // Step 1: TUTOR — resolve word anchors
         let tutor_context: Vec<String> = match jump_context(command, tile_registry) {
@@ -185,6 +229,7 @@ impl PlatoKernel {
             tutor_context,
             audit,
             episode_id: entry.id,
+            instinct_reflexes: None,
         }
     }
 
@@ -295,6 +340,95 @@ pub struct ActionResult {
     pub tutor_context: Vec<String>,
     pub audit: constraint_engine::AuditOutcome,
     pub episode_id: String,
+    /// Names of instinct reflexes that fired (if instinct context was provided).
+    pub instinct_reflexes: Option<Vec<String>>,
+}
+
+/// Context needed for instinct pre-check in process_command.
+/// Mirrors the inputs to flux-instinct's InstinctEngine::tick().
+#[derive(Debug, Clone)]
+pub struct InstinctContext {
+    pub engine: InstinctEngine,
+    /// Current energy fraction [0.0, 1.0]. Use 0.15 for critical, 0.4 for low.
+    pub energy: f32,
+    /// Current threat level [0.0, 1.0]. Use 0.7 for high.
+    pub threat: f32,
+    /// Trust level for the requesting identity [0.0, 1.0].
+    pub trust: f32,
+    /// Whether the peer/agent is still alive.
+    pub peer_alive: bool,
+    /// Whether there is active work to guard.
+    pub has_work: bool,
+}
+
+// --- Inline instinct types (mirrors flux-instinct API for zero-dep wiring) ---
+
+/// Mirrors flux-instinct::InstinctType for zero-dependency integration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum InstinctType {
+    Survive = 0, Flee = 1, Guard = 2, Report = 3, Hoard = 4,
+    Cooperate = 5, Teach = 6, Curious = 7, Mourn = 8, Evolve = 9, None = 99,
+}
+
+impl InstinctType {
+    pub fn name(self) -> &'static str {
+        match self {
+            InstinctType::Survive => "survive", InstinctType::Flee => "flee",
+            InstinctType::Guard => "guard", InstinctType::Report => "report",
+            InstinctType::Hoard => "hoard", InstinctType::Cooperate => "cooperate",
+            InstinctType::Teach => "teach", InstinctType::Curious => "curious",
+            InstinctType::Mourn => "mourn", InstinctType::Evolve => "evolve",
+            InstinctType::None => "none",
+        }
+    }
+}
+
+/// Mirrors flux-instinct::Reflex for zero-dependency integration.
+#[derive(Debug, Clone)]
+pub struct Reflex {
+    pub instinct: InstinctType,
+    pub urgency: f32,
+    pub suppressed: bool,
+}
+
+impl Reflex {
+    pub fn new(instinct: InstinctType, urgency: f32) -> Self {
+        Self { instinct, urgency: urgency.clamp(0.0, 1.0), suppressed: false }
+    }
+}
+
+/// Minimal instinct engine — mirrors flux-instinct's core logic.
+/// For production use, swap this for a direct dependency on flux-instinct.
+#[derive(Clone, Debug)]
+pub struct InstinctEngine {
+    energy_critical: f32,
+    threat_high: f32,
+}
+
+impl InstinctEngine {
+    pub fn new() -> Self { Self { energy_critical: 0.15, threat_high: 0.7 } }
+
+    /// Run one instinct tick. Returns reflexes sorted by urgency descending.
+    pub fn tick(&self, energy: f32, threat: f32, trust: f32, peer_alive: bool, _has_work: bool) -> Vec<Reflex> {
+        let mut reflexes = Vec::new();
+        if energy <= self.energy_critical {
+            reflexes.push(Reflex::new(InstinctType::Survive, 1.0));
+        }
+        if threat > self.threat_high {
+            let urgency = ((threat - self.threat_high) / (1.0 - self.threat_high)).clamp(0.0, 1.0);
+            reflexes.push(Reflex::new(InstinctType::Flee, urgency));
+        }
+        if trust > 0.8 {
+            reflexes.push(Reflex::new(InstinctType::Teach, 0.6));
+        } else if trust > 0.6 {
+            reflexes.push(Reflex::new(InstinctType::Cooperate, 0.5));
+        }
+        if threat > 0.3 && threat <= self.threat_high {
+            reflexes.push(Reflex::new(InstinctType::Report, 0.4));
+        }
+        reflexes.sort_by(|a, b| b.urgency.partial_cmp(&a.urgency).unwrap());
+        reflexes
+    }
 }
 
 #[tokio::main]
