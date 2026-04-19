@@ -17,6 +17,7 @@ mod git_runtime;
 mod i2i;
 mod perspective;
 mod plugin;
+mod state_bridge;
 mod tiling;
 mod tutor;
 
