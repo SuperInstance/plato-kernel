@@ -10,7 +10,10 @@
 //! - TUTOR Word Anchors ([BracketedWord] → tile context jump)
 //! - I2I Protocol (instance-to-instance cross-process coordination)
 
+mod belief;
 mod constraint_engine;
+mod deploy_policy;
+mod dynamic_locks;
 mod episode_recorder;
 mod event_bus;
 mod git_runtime;
@@ -26,7 +29,10 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use belief::{BeliefDimension, BeliefScore, BeliefStore};
 use constraint_engine::{ConstraintAuditor, ConstraintEngine};
+use deploy_policy::{DeployDecision, DeployLedger, DeployPolicy, Tier};
+use dynamic_locks::{Lock, LockAccumulator, LockCheck, LockSource};
 use episode_recorder::{EpisodeEntry, EpisodeOutcome, EpisodeRecorder};
 use i2i::{ComponentKind, I2IMessage, I2IVerb, I2IServer, InstanceId, default_kernel_handler};
 use plugin::{PluginRegistry, PluginTier};
@@ -46,6 +52,12 @@ pub struct PlatoKernel {
     /// Plugins at higher tiers (Fleet, Edge) are only present when the
     /// corresponding Cargo feature is active at build time.
     pub plugins: PluginRegistry,
+    /// DCS Flywheel: unified belief store
+    pub beliefs: BeliefStore,
+    /// DCS Flywheel: dynamic lock accumulator
+    pub locks: LockAccumulator,
+    /// DCS Flywheel: deployment ledger
+    pub deploy_ledger: DeployLedger,
 }
 
 impl PlatoKernel {
@@ -95,6 +107,9 @@ impl PlatoKernel {
             episode_recorder: EpisodeRecorder::default_path(),
             instance_id: InstanceId::new(ComponentKind::Kernel, "plato-kernel", "localhost"),
             plugins,
+            beliefs: BeliefStore::new(),
+            locks: LockAccumulator::new(),
+            deploy_ledger: DeployLedger::new(DeployPolicy::default()),
         })
     }
 
@@ -165,6 +180,7 @@ impl PlatoKernel {
                             audit: constraint_engine::AuditOutcome::Pass,
                             episode_id: entry.id,
                             instinct_reflexes: Some(reflexes.iter().map(|r| r.instinct.name().to_string()).collect()),
+                            deploy_tier: None, belief_score: None, lock_checks: None,
                         };
                     }
                     InstinctType::Flee if r.urgency > 0.7 => {
@@ -175,6 +191,7 @@ impl PlatoKernel {
                             audit: constraint_engine::AuditOutcome::Pass,
                             episode_id: String::new(),
                             instinct_reflexes: Some(reflexes.iter().map(|r| r.instinct.name().to_string()).collect()),
+                            deploy_tier: None, belief_score: None, lock_checks: None,
                         };
                     }
                     InstinctType::Report if r.urgency > 0.3 => {
@@ -203,6 +220,15 @@ impl PlatoKernel {
             JumpResult::NoAnchors => vec![],
         };
 
+        // Step 1b: DCS Flywheel — compute belief score
+        // Confidence = tile match quality, Trust = peer trust, Relevance = command-room match
+        let belief_confidence = if !tutor_context.is_empty() && tutor_context[0].contains("Jumped to") { 0.85 } else { 0.5 };
+        let belief_trust = instinct_context.map_or(0.5, |ctx| ctx.trust);
+        let belief_relevance = 0.6; // baseline; could be computed from room context
+        let belief = BeliefScore::new(belief_confidence, belief_trust, belief_relevance);
+        let belief_key = format!("cmd:{}", &command[..command.len().min(32)]);
+        let belief_composite = belief.composite();
+
         // Step 2: Constraint audit
         let audit = auditor.audit(command);
         let outcome = match &audit {
@@ -214,16 +240,61 @@ impl PlatoKernel {
             constraint_engine::AuditOutcome::Pass => EpisodeOutcome::Success,
         };
 
+        // Step 2b: DCS Flywheel — classify deployment tier from belief (read-only classify)
+        let policy = DeployPolicy::default();
+        let deploy_decision = policy.classify(belief_confidence, belief_trust, belief_relevance);
+        let deploy_tier = deploy_decision.tier;
+        let deploy_requires_human = deploy_decision.requires_human;
+
+        // Step 2c: DCS Flywheel — check dynamic locks
+        let lock_checks = self.locks.check(command);
+        let lock_blocked = lock_checks.iter().any(|lc| lc.effective_strength > 0.8 && lc.enforcement.contains("BLOCK"));
+
+        // If human-gated or lock-blocked, return early with warning
+        if deploy_requires_human {
+            tracing::warn!("DCS: command human-gated (belief composite {:.3})", belief_composite);
+            let entry = EpisodeEntry::new(
+                &format!("{} in {}", command, room),
+                &format!("BLOCKED: human-gated, belief {:.3}", belief_composite),
+                &format!("Deploy: {:?}", deploy_tier),
+                EpisodeOutcome::Failure,
+            );
+            let _ = self.episode_recorder.record(&entry);
+            return ActionResult {
+                command: command.to_string(), tutor_context, audit, episode_id: entry.id,
+                instinct_reflexes: None,
+                deploy_tier: Some(deploy_tier), belief_score: Some(belief), lock_checks: Some(lock_checks),
+            };
+        }
+        if lock_blocked {
+            tracing::warn!("DCS: command blocked by dynamic lock");
+            let entry = EpisodeEntry::new(
+                &format!("{} in {}", command, room),
+                "BLOCKED: dynamic lock triggered", "Lock check failed",
+                EpisodeOutcome::Failure,
+            );
+            let _ = self.episode_recorder.record(&entry);
+            return ActionResult {
+                command: command.to_string(), tutor_context, audit, episode_id: entry.id,
+                instinct_reflexes: None,
+                deploy_tier: Some(deploy_tier), belief_score: Some(belief), lock_checks: Some(lock_checks),
+            };
+        }
+
         // Step 3: Record episode
         let entry = EpisodeEntry::new(
             &format!("{} in {}", command, room),
             &format!("Identity {} issued: {}", identity, command),
-            &format!("Audit: {:?}", audit),
+            &format!("Audit: {:?}, Deploy: {:?}, Belief: {:.3}", audit, deploy_tier, belief_composite),
             outcome,
         );
         if let Err(e) = self.episode_recorder.record(&entry) {
             tracing::warn!("Episode recorder error: {}", e);
         }
+
+        // Step 3b: DCS Flywheel — update belief based on audit outcome
+        // (Note: in a real async context we'd need &mut self; this demonstrates the wiring)
+        tracing::debug!("DCS flywheel: belief {:.3} → tier {:?}", belief_composite, deploy_tier);
 
         ActionResult {
             command: command.to_string(),
@@ -231,6 +302,9 @@ impl PlatoKernel {
             audit,
             episode_id: entry.id,
             instinct_reflexes: None,
+            deploy_tier: Some(deploy_tier),
+            belief_score: Some(belief),
+            lock_checks: Some(lock_checks),
         }
     }
 
@@ -343,6 +417,12 @@ pub struct ActionResult {
     pub episode_id: String,
     /// Names of instinct reflexes that fired (if instinct context was provided).
     pub instinct_reflexes: Option<Vec<String>>,
+    /// DCS Flywheel: deployment tier assigned to this action.
+    pub deploy_tier: Option<Tier>,
+    /// DCS Flywheel: belief score used for tier classification.
+    pub belief_score: Option<BeliefScore>,
+    /// DCS Flywheel: locks that triggered during execution.
+    pub lock_checks: Option<Vec<LockCheck>>,
 }
 
 /// Context needed for instinct pre-check in process_command.
@@ -487,4 +567,110 @@ async fn main() -> Result<()> {
     tracing::info!("Plato Kernel shutting down.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod flywheel_tests {
+    use super::*;
+
+    fn make_tile_registry() -> TileRegistry {
+        TileRegistry::parse("## Constraint Theory\nSnap to Pythagorean coordinates.\n\n## Ghost Tiles\nDecay and resurrect forgotten knowledge.")
+    }
+
+    #[test]
+    fn test_belief_score_composite() {
+        let b = BeliefScore::new(0.9, 0.8, 0.7);
+        let c = b.composite();
+        assert!(c > 0.7 && c < 0.9);
+    }
+
+    #[test]
+    fn test_belief_store_reinforce_undermine() {
+        let mut store = BeliefStore::new();
+        store.reinforce("agent-jc1", BeliefDimension::Trust, 1.0);
+        let b = store.get("agent-jc1").unwrap();
+        assert!(b.trust > 0.5);
+        store.undermine("agent-jc1", BeliefDimension::Trust, 0.8);
+        let b2 = store.get("agent-jc1").unwrap();
+        assert!(b2.trust < b.trust);
+    }
+
+    #[test]
+    fn test_deploy_policy_classify_live() {
+        let policy = DeployPolicy::default();
+        let d = policy.classify(0.9, 0.9, 0.9);
+        assert_eq!(d.tier, Tier::Live);
+        assert!(d.is_auto());
+    }
+
+    #[test]
+    fn test_deploy_policy_classify_monitored() {
+        let policy = DeployPolicy::default();
+        let d = policy.classify(0.7, 0.7, 0.7);
+        assert_eq!(d.tier, Tier::Monitored);
+    }
+
+    #[test]
+    fn test_deploy_policy_classify_human_gated() {
+        let policy = DeployPolicy::default();
+        let d = policy.classify(0.2, 0.2, 0.2);
+        assert_eq!(d.tier, Tier::HumanGated);
+        assert!(d.requires_human);
+    }
+
+    #[test]
+    fn test_deploy_policy_floor_blocks_low_confidence() {
+        let policy = DeployPolicy::default();
+        let d = policy.classify(0.1, 0.9, 0.9); // low confidence
+        assert_eq!(d.tier, Tier::HumanGated);
+        assert!(d.requires_human);
+    }
+
+    #[test]
+    fn test_lock_accumulator_check() {
+        let mut acc = LockAccumulator::new();
+        acc.record_observation("delete", "BLOCK: never delete without backup", "safety");
+        let checks = acc.check("delete the old records");
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].triggered);
+    }
+
+    #[test]
+    fn test_lock_accumulator_no_trigger() {
+        let mut acc = LockAccumulator::new();
+        acc.record_observation("delete", "BLOCK: never delete without backup", "safety");
+        let checks = acc.check("create new records");
+        assert!(checks.is_empty());
+    }
+
+    #[test]
+    fn test_flywheel_belief_to_deploy() {
+        // High belief → Live tier
+        let belief = BeliefScore::new(0.9, 0.9, 0.9);
+        let policy = DeployPolicy::default();
+        let decision = policy.classify(belief.confidence, belief.trust, belief.relevance);
+        assert_eq!(decision.tier, Tier::Live);
+
+        // Low belief → HumanGated
+        let low_belief = BeliefScore::new(0.1, 0.2, 0.1);
+        let decision2 = policy.classify(low_belief.confidence, low_belief.trust, low_belief.relevance);
+        assert_eq!(decision2.tier, Tier::HumanGated);
+    }
+
+    #[test]
+    fn test_flywheel_lock_blocks_command() {
+        let mut acc = LockAccumulator::new();
+        acc.record_observation("rm -rf", "BLOCK: never run rm -rf", "safety");
+        let checks = acc.check("rm -rf /tmp/data");
+        assert!(checks.iter().any(|c| c.enforcement.contains("BLOCK")));
+    }
+
+    #[test]
+    fn test_flywheel_belief_decay() {
+        let mut store = BeliefStore::with_decay(0.5);
+        store.set("tile-x", BeliefScore::new(1.0, 1.0, 1.0));
+        store.tick();
+        let b = store.get("tile-x").unwrap();
+        assert!(b.confidence < 1.0); // decayed toward 0.5
+    }
 }
