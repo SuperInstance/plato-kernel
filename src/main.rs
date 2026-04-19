@@ -12,6 +12,7 @@
 
 mod belief;
 mod constraint_engine;
+mod deadband;
 mod deploy_policy;
 mod dynamic_locks;
 mod episode_recorder;
@@ -21,6 +22,8 @@ mod i2i;
 mod perspective;
 mod plugin;
 mod state_bridge;
+mod temporal_decay;
+mod tile_scoring;
 mod tiling;
 mod tutor;
 
@@ -159,6 +162,40 @@ impl PlatoKernel {
         instinct_context: Option<&InstinctContext>,
     ) -> ActionResult {
         tracing::debug!("process_command: {} in {} → {:?}", identity, room, command);
+
+        // Step -1: Deadband safety check — before anything else
+        {
+            use state_bridge::StateBridge;
+            let bridge = state_bridge::DefaultStateBridge::new();
+            let db_check = bridge.check_deadband(command);
+            if !db_check.p0_clear {
+                tracing::warn!("Deadband P0 violation: {:?}", db_check.violations);
+                return ActionResult {
+                    command: command.to_string(),
+                    tutor_context: vec![format!("[DEADBAND] P0 violation: {}", db_check.violations.join(", "))],
+                    audit: constraint_engine::AuditOutcome::Pass,
+                    episode_id: String::new(),
+                    instinct_reflexes: None,
+                    deploy_tier: None,
+                    belief_score: None,
+                    lock_checks: None,
+                };
+            }
+            if !db_check.p1_clear {
+                tracing::warn!("Deadband P1 violation — FSM fallback");
+                // P1 miss = use FSM fallback (annotate but don't block hard)
+                return ActionResult {
+                    command: command.to_string(),
+                    tutor_context: vec![format!("[DEADBAND] P1 flagged: {} — using FSM fallback", db_check.violations.join(", "))],
+                    audit: constraint_engine::AuditOutcome::Pass,
+                    episode_id: String::new(),
+                    instinct_reflexes: None,
+                    deploy_tier: None,
+                    belief_score: None,
+                    lock_checks: None,
+                };
+            }
+        }
 
         // Step 0: Instinct pre-check — reflexes before logic
         if let Some(ctx) = instinct_context {

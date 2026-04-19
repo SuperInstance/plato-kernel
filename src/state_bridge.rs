@@ -75,6 +75,26 @@ pub trait StateBridge {
     /// Returns 0.0 (contradictory) to 1.0 (perfectly aligned).
     /// Used to detect hallucination, drift, or constraint violations.
     fn check_coherence(&self, deterministic: &BridgedResult, generative: &BridgedResult) -> f64;
+
+    /// Run deadband safety check on an action string.
+    /// Default impl always passes (override in DefaultStateBridge).
+    fn check_deadband(&self, _action: &str) -> crate::deadband::DeadbandCheck {
+        crate::deadband::DeadbandCheck {
+            passed: true,
+            p0_clear: true,
+            p1_clear: true,
+            violations: vec![],
+            recommended_channel: None,
+        }
+    }
+
+    /// Score a slice of tiles against a query.
+    /// tiles: (question, answer, domain, confidence, ghost_score, use_count)
+    fn score_tiles(&self, tiles: &[(&str, &str, &str, f64, f64, u32)], query: &str) -> Vec<crate::tile_scoring::TileScore> {
+        tiles.iter().enumerate().map(|(i, (q, a, d, conf, ghost, uses))| {
+            crate::tile_scoring::score_tile(i, query, q, a, &[], d, *conf, *ghost, *uses)
+        }).collect()
+    }
 }
 
 /// Default StateBridge implementation — keyword overlap + constraint match.
@@ -88,11 +108,16 @@ pub trait StateBridge {
 pub struct DefaultStateBridge {
     /// Minimum coherence threshold for Hybrid results.
     coherence_threshold: f64,
+    /// Deadband engine for safety pre-checks.
+    pub deadband: crate::deadband::DeadbandEngine,
 }
 
 impl DefaultStateBridge {
     pub fn new() -> Self {
-        Self { coherence_threshold: 0.3 }
+        Self {
+            coherence_threshold: 0.3,
+            deadband: crate::deadband::DeadbandEngine::new(),
+        }
     }
 
     pub fn with_threshold(mut self, threshold: f64) -> Self {
@@ -154,6 +179,10 @@ impl StateBridge for DefaultStateBridge {
         let union: std::collections::HashSet<String> =
             det_words.iter().chain(gen_words.iter()).cloned().collect();
         overlap as f64 / union.len() as f64
+    }
+
+    fn check_deadband(&self, action: &str) -> crate::deadband::DeadbandCheck {
+        self.deadband.check(action)
     }
 }
 
