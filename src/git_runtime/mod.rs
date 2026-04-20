@@ -70,7 +70,7 @@ impl GitRuntime {
             let index_content = std::fs::read_to_string(&index_path)?;
             let fleet_index: FleetIndex = serde_yaml::from_str(&index_content)?;
             self.fleet_index = Some(fleet_index);
-            tracing::info!("Loaded fleet index with {} rooms", self.fleet_index.as_ref().unwrap().rooms.len());
+            tracing::info!("Loaded fleet index with {} rooms", self.fleet_index.as_ref().map_or(0, |f| f.rooms.len()));
         } else {
             tracing::warn!("Agora missing plato-index.yaml, fleet discovery disabled");
         }

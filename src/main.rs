@@ -544,7 +544,7 @@ impl InstinctEngine {
         if threat > 0.3 && threat <= self.threat_high {
             reflexes.push(Reflex::new(InstinctType::Report, 0.4));
         }
-        reflexes.sort_by(|a, b| b.urgency.partial_cmp(&a.urgency).unwrap());
+        reflexes.sort_by(|a, b| b.urgency.partial_cmp(&a.urgency).unwrap_or(std::cmp::Ordering::Equal));
         reflexes
     }
 }
