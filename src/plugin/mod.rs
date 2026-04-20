@@ -313,18 +313,31 @@ impl PluginRegistry {
     ///
     /// Location: `src/plugin/mod.rs`, method `mount_tier` — ~8-12 lines.
     pub fn mount_tier(&mut self, tier: PluginTier) -> Result<Vec<MountPlan>, DependencyError> {
-        // TODO: implement this. Suggested shape:
-        //
-        //   let targets: Vec<String> = self.plugins
-        //       .iter()
-        //       .filter(|(_, p)| p.manifest().tier == tier)
-        //       .map(|(id, _)| id.clone())
-        //       .collect();
-        //
-        //   // sort `targets` by your chosen strategy, then mount each.
-        //   // Return early on error (fail-fast) or accumulate results (best-effort).
-        let _ = tier;
-        todo!("implement mount_tier — see doc-comment above for guidance")
+        // Collect plugins matching this tier, sorted by dependency count
+        // (fewer deps first → minimises retry iterations).
+        let mut targets: Vec<String> = self.plugins
+            .iter()
+            .filter(|(_, p)| p.manifest().tier == tier)
+            .map(|(id, _)| id.clone())
+            .collect();
+        targets.sort_by(|a, b| {
+            let da = self.plugins[a].manifest().requires.len();
+            let db = self.plugins[b].manifest().requires.len();
+            da.cmp(&db).then_with(|| a.cmp(b))
+        });
+
+        // Fail-fast: resolve and mount each; return on first error.
+        let mut plans = Vec::with_capacity(targets.len());
+        for id in targets {
+            // Skip already-mounted plugins.
+            if self.mounted.contains(&id) {
+                continue;
+            }
+            let plan = self.resolve_mount(&id)?;
+            self.apply_plan(&plan);
+            plans.push(plan);
+        }
+        Ok(plans)
     }
 
     /// Returns `true` if a mounted plugin declares `capability` in its `provides` list.
@@ -490,6 +503,85 @@ mod tests {
 
         assert_eq!(first,  vec!["a"]);
         assert!(second.is_empty()); // idempotent — already mounted
+    }
+
+    #[test]
+    fn test_mount_tier_basic() {
+        let mut reg = PluginRegistry::new();
+        reg.register(make_plugin("core-a", PluginTier::Core, vec![], vec!["cap-a"])).unwrap();
+        reg.register(make_plugin("core-b", PluginTier::Core, vec!["core-a"], vec!["cap-b"])).unwrap();
+
+        let plans = reg.mount_tier(PluginTier::Core).unwrap();
+        assert!(reg.is_mounted("core-a"));
+        assert!(reg.is_mounted("core-b"));
+        assert!(!plans.is_empty());
+    }
+
+    #[test]
+    fn test_mount_tier_ignores_other_tiers() {
+        let mut reg = PluginRegistry::new();
+        reg.register(make_plugin("core-1", PluginTier::Core,  vec![], vec![])).unwrap();
+        reg.register(make_plugin("fleet-1", PluginTier::Fleet, vec!["core-1"], vec![])).unwrap();
+
+        // Mounting Core tier should NOT mount fleet-1.
+        reg.mount_tier(PluginTier::Core).unwrap();
+        assert!(reg.is_mounted("core-1"));
+        assert!(!reg.is_mounted("fleet-1"));
+    }
+
+    #[test]
+    fn test_mount_tier_cross_tier_deps() {
+        let mut reg = PluginRegistry::new();
+        reg.register(make_plugin("core-1", PluginTier::Core,  vec![], vec![])).unwrap();
+        reg.register(make_plugin("fleet-1", PluginTier::Fleet, vec!["core-1"], vec![])).unwrap();
+
+        // Mounting Fleet tier should auto-resolve Core deps.
+        let plans = reg.mount_tier(PluginTier::Fleet).unwrap();
+        assert!(reg.is_mounted("core-1"));
+        assert!(reg.is_mounted("fleet-1"));
+    }
+
+    #[test]
+    fn test_mount_tier_idempotent() {
+        let mut reg = PluginRegistry::new();
+        reg.register(make_plugin("core-1", PluginTier::Core, vec![], vec![])).unwrap();
+
+        reg.mount_tier(PluginTier::Core).unwrap();
+        let plans2 = reg.mount_tier(PluginTier::Core).unwrap();
+        // Second call should produce no new plans (already mounted).
+        assert!(plans2.is_empty());
+    }
+
+    #[test]
+    fn test_mount_tier_fail_fast() {
+        let mut reg = PluginRegistry::new();
+        reg.register(make_plugin("core-ok",  PluginTier::Core, vec![], vec![])).unwrap();
+        reg.register(make_plugin("core-bad", PluginTier::Core, vec!["nonexistent"], vec![])).unwrap();
+
+        let err = reg.mount_tier(PluginTier::Core).unwrap_err();
+        assert!(matches!(err, DependencyError::MissingDependency { .. }));
+    }
+
+    #[test]
+    fn test_mount_tier_respects_dependency_order() {
+        let mut reg = PluginRegistry::new();
+        // Register in reverse dependency order to test sorting.
+        reg.register(make_plugin("c", PluginTier::Core, vec!["b"], vec![])).unwrap();
+        reg.register(make_plugin("b", PluginTier::Core, vec!["a"], vec![])).unwrap();
+        reg.register(make_plugin("a", PluginTier::Core, vec![], vec![])).unwrap();
+
+        reg.mount_tier(PluginTier::Core).unwrap();
+        assert!(reg.is_mounted("a"));
+        assert!(reg.is_mounted("b"));
+        assert!(reg.is_mounted("c"));
+    }
+
+    #[test]
+    fn test_mount_tier_empty() {
+        let mut reg = PluginRegistry::new();
+        // No plugins registered — should return Ok with empty plans.
+        let plans = reg.mount_tier(PluginTier::Core).unwrap();
+        assert!(plans.is_empty());
     }
 
     #[test]
