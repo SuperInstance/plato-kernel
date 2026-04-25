@@ -1,5 +1,8 @@
 # plato-kernel
 
+[![crates.io](https://img.shields.io/crates/v/plato-kernel)](https://crates.io/crates/plato-kernel) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+
 Core Rust crate for the PLATO knowledge system — event sourcing, constraint filtering, tile lifecycle management.
 
 ## Features
