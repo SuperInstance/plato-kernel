@@ -6,7 +6,7 @@ members = [
 
 [package]
 name = "plato-kernel"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 description = "Plato Kernel - Event sourcing + Constraint-Theory + Git runtime"
 license = "MIT"
