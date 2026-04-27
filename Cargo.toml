@@ -1,8 +1,3 @@
-[workspace]
-members = [
-    ".",
-    "crates/constraint-theory-core",
-]
 
 [package]
 name = "plato-kernel"
@@ -10,10 +5,12 @@ version = "0.2.0"
 edition = "2021"
 description = "Plato Kernel - Event sourcing + Constraint-Theory + Git runtime"
 license = "MIT"
+repository = "https://github.com/SuperInstance/plato-kernel"
+exclude = ["crates/", "target/", ".git/"]
 
 [dependencies]
 # Constraint Theory core types (local crate — workspace member)
-constraint-theory-core = { path = "crates/constraint-theory-core" }
+constraint-theory-core = "2.0.0"
 
 # Async runtime
 tokio = { version = "1.36", features = ["full"] }
